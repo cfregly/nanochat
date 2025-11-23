@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 import signal
 import warnings
+import os
 from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
@@ -91,12 +92,17 @@ class KVCache:
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
         self.pos = 0 # current position in time in the cache
+        self.row_pos = None # optional per-row positions when using padded variable-length inputs
 
     def reset(self):
         self.pos = 0
+        self.row_pos = None
 
     def get_pos(self):
-        return self.pos
+        return self.pos if self.row_pos is None else int(self.row_pos.max().item())
+
+    def get_row_pos(self):
+        return self.row_pos
 
     def prefill(self, other):
         """
@@ -125,31 +131,66 @@ class KVCache:
         self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
         # 4) update the pos
         self.pos = other.pos
+        if other.row_pos is not None:
+            self.row_pos = other.row_pos.clone()
 
-    def insert_kv(self, layer_idx, k, v):
+    def _maybe_grow_cache(self, t_needed, dtype, device):
+        """Grow kv_cache time dimension to at least t_needed."""
+        if t_needed <= self.kv_cache.size(4):
+            return
+        t_needed = (t_needed + 1023) & ~1023 # round up to the nearest multiple of 1024
+        additional_shape = list(self.kv_cache.shape)
+        additional_shape[4] = t_needed - self.kv_cache.size(4)
+        additional_cache = torch.empty(additional_shape, dtype=dtype, device=device)
+        self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
+        self.kv_shape = self.kv_cache.shape
+
+    def insert_kv(self, layer_idx, k, v, token_mask=None):
         # Lazy initialize the cache here because we need to know the dtype/device
         if self.kv_cache is None:
             self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
         # Insert new keys/values to the cache and return the full cache so far
         B, H, T_add, D = k.size()
-        t0, t1 = self.pos, self.pos + T_add
-        # Dynamically grow the cache if needed
-        if t1 > self.kv_cache.size(4):
-            t_needed = t1 + 1024 # as much as we need plus buffer of 1024
-            t_needed = (t_needed + 1023) & ~1023 # then round up to the nearest multiple of 1024
-            additional_shape = list(self.kv_cache.shape)
-            additional_shape[4] = t_needed - self.kv_cache.size(4)
-            additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
-            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
-            self.kv_shape = self.kv_cache.shape
-        # Insert k, v into the cache
-        self.kv_cache[layer_idx, 0, :, :, t0:t1] = k
-        self.kv_cache[layer_idx, 1, :, :, t0:t1] = v
+        use_row_pos = token_mask is not None or self.row_pos is not None
+        if token_mask is not None:
+            token_mask = token_mask.to(device=k.device, dtype=torch.bool)
+        if use_row_pos:
+            if self.row_pos is None:
+                self.row_pos = torch.zeros(B, device=k.device, dtype=torch.long)
+            else:
+                assert self.row_pos.numel() == B, f"row_pos shape mismatch: {self.row_pos.numel()} != {B}"
+            if token_mask is None:
+                token_mask = torch.ones((B, T_add), device=k.device, dtype=torch.bool)
+            # ensure we have enough capacity for the maximum position that will be written
+            base_row_pos = self.row_pos
+            max_needed = int((base_row_pos + token_mask.sum(dim=1)).max().item())
+            self._maybe_grow_cache(max_needed, k.dtype, k.device)
+            batch_idx = torch.arange(B, device=k.device)
+            for t in range(T_add):
+                active = token_mask[:, t]
+                if not torch.any(active):
+                    continue
+                rows = batch_idx[active]
+                positions = base_row_pos[active] + t
+                self.kv_cache[layer_idx, 0, rows, :, positions] = k[active, :, t, :]
+                self.kv_cache[layer_idx, 1, rows, :, positions] = v[active, :, t, :]
+            if layer_idx == self.kv_cache.size(0) - 1:
+                self.row_pos = base_row_pos + token_mask.sum(dim=1)
+                self.pos = int(self.row_pos.max().item())
+            t1_source = self.row_pos if layer_idx == self.kv_cache.size(0) - 1 else base_row_pos + token_mask.sum(dim=1)
+            t1 = int(t1_source.max().item())
+        else:
+            t0, t1 = self.pos, self.pos + T_add
+            self._maybe_grow_cache(t1, k.dtype, k.device)
+            self.kv_cache[layer_idx, 0, :, :, t0:t1] = k
+            self.kv_cache[layer_idx, 1, :, :, t0:t1] = v
+            if layer_idx == self.kv_cache.size(0) - 1:
+                self.pos = t1
         # Return the full cached keys/values up to current position (as a view)
         key_view = self.kv_cache[layer_idx, 0, :, :, :t1]
         value_view = self.kv_cache[layer_idx, 1, :, :, :t1]
-        # Increment pos after the last layer of the Transformer processes
-        if layer_idx == self.kv_cache.size(0) - 1:
+        # Increment pos after the last layer of the Transformer processes (for per-row, track max)
+        if use_row_pos and layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
         return key_view, value_view
 
@@ -186,9 +227,59 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, reuse_ids_buffer=True, enable_batch_decode=False):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        self.reuse_ids_buffer = reuse_ids_buffer
+        self.enable_batch_decode = enable_batch_decode
+        self._compile_error = None
+        if self.enable_batch_decode:
+            self.model.config.use_padded_attention = True
+            # propagate to attention modules (they cache the flag at init time)
+            for block in getattr(self.model.transformer, "h", []):
+                block.attn.use_padded_attention = True
+        self._maybe_compile_model()
+
+    def _maybe_compile_model(self):
+        """Use torch.compile by default on Blackwell/GB200 for steadier decode overhead."""
+        if os.getenv("NANOCHAT_DISABLE_COMPILE", "0") == "1":
+            return
+        if not torch.cuda.is_available() or not hasattr(torch, "compile"):
+            return
+        cc_major, _ = torch.cuda.get_device_capability()
+        if cc_major < 10:
+            return
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=False)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - defensive
+            self._compile_error = str(exc)
+
+    def _expand_param(self, value, batch_size, default=None):
+        if isinstance(value, (list, tuple)):
+            assert len(value) == batch_size, f"Expected {batch_size} values, got {len(value)}"
+            return list(value)
+        if value is None:
+            return [default] * batch_size
+        return [value] * batch_size
+
+    def _build_attention_mask(self, lengths, max_len=None):
+        max_len = int(max_len if max_len is not None else lengths.max().item())
+        if max_len <= 0:
+            return torch.zeros((lengths.size(0), 0), dtype=torch.bool, device=lengths.device)
+        positions = torch.arange(max_len, device=lengths.device)
+        return positions.unsqueeze(0) < lengths.unsqueeze(1)
+
+    def _sample_batch_tokens(self, logits, rng, temperatures, top_ks, active_mask, pad_id):
+        sampled_tokens = [pad_id] * logits.size(0)
+        active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        if active_indices.numel() == 0:
+            return sampled_tokens
+        for idx in active_indices.tolist():
+            temp = temperatures[idx]
+            top_k = top_ks[idx]
+            next_id = sample_next_token(logits[idx:idx+1], rng, temperature=temp, top_k=top_k)
+            sampled_tokens[idx] = next_id[0, 0].item()
+        return sampled_tokens
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -233,6 +324,7 @@ class Engine:
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        ids_buf = torch.empty((num_samples, 1), dtype=torch.long, device=device) if self.reuse_ids_buffer else None
 
         # 4) Main generation loop
         num_generated = 0
@@ -294,8 +386,146 @@ class Engine:
             yield token_column, token_masks
             num_generated += 1
             # Prepare ids for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            if self.reuse_ids_buffer:
+                ids_buf[:, 0] = torch.tensor(token_column, dtype=torch.long, device=device)
+                ids = ids_buf
+            else:
+                ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
 
+    @torch.inference_mode()
+    def generate_batched(self, prompt_tokens_batch, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """Stream tokens for a batch of variable-length prompts using padded attention."""
+        if not self.enable_batch_decode:
+            raise ValueError("enable_batch_decode is False; cannot use batched generation")
+        assert isinstance(prompt_tokens_batch, list) and len(prompt_tokens_batch) > 0 and all(isinstance(p, list) for p in prompt_tokens_batch), "expecting list of token lists"
+
+        device = self.model.get_device()
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        batch_size = len(prompt_tokens_batch)
+        pad_id = self.tokenizer.get_bos_token_id()
+        temps = self._expand_param(temperature, batch_size, temperature if temperature is not None else 1.0)
+        top_ks = self._expand_param(top_k, batch_size, top_k)
+        fallback_max = self.model.config.sequence_len if max_tokens is None else (max_tokens if isinstance(max_tokens, int) else self.model.config.sequence_len)
+        max_tokens_list = self._expand_param(max_tokens, batch_size, fallback_max)
+        row_max_tokens = [mt if mt is not None else fallback_max for mt in max_tokens_list]
+        generated_counts = [0] * batch_size
+
+        lengths = torch.tensor([len(p) for p in prompt_tokens_batch], device=device, dtype=torch.long)
+        max_prompt_len = int(lengths.max().item())
+        if max_prompt_len == 0:
+            raise ValueError("prompt batch must contain at least one token")
+        ids = torch.full((batch_size, max_prompt_len), pad_id, dtype=torch.long, device=device)
+        for i, seq in enumerate(prompt_tokens_batch):
+            if len(seq) == 0:
+                continue
+            ids[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+
+        attention_mask = self._build_attention_mask(lengths, max_prompt_len)
+
+        m = self.model.config
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_length_hint = max_prompt_len + int(max(row_max_tokens)) if row_max_tokens else max_prompt_len
+        kv_cache_prefill = KVCache(
+            batch_size=batch_size,
+            seq_len=max_prompt_len,
+            **kv_model_kwargs,
+        )
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, attention_mask=attention_mask, token_mask=attention_mask)
+        last_indices = (lengths - 1).clamp(min=0)
+        logits = logits[torch.arange(batch_size, device=device), last_indices, :]
+
+        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        sampled_tokens = self._sample_batch_tokens(logits, rng, temps, top_ks, active_mask, pad_id)
+
+        kv_cache_decode = KVCache(
+            batch_size=batch_size,
+            seq_len=kv_length_hint,
+            **kv_model_kwargs,
+        )
+        kv_cache_decode.prefill(kv_cache_prefill)
+        del kv_cache_prefill
+
+        row_states = [RowState(tokens.copy()) for tokens in prompt_tokens_batch]
+        lengths_by_batch = lengths.clone()
+        ids_buf = torch.empty((batch_size, 1), dtype=torch.long, device=device) if self.reuse_ids_buffer else None
+
+        # Special tokens for control flow
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        python_start = get_special("<|python_start|>")
+        python_end = get_special("<|python_end|>")
+        output_start = get_special("<|output_start|>")
+        output_end = get_special("<|output_end|>")
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+
+        num_generated = 0
+        max_total_steps = max(row_max_tokens) if row_max_tokens else 0
+        first_iteration = True
+        token_column = None
+
+        while True:
+            if all(state.completed or generated_counts[i] >= row_max_tokens[i] for i, state in enumerate(row_states)):
+                break
+            if max_total_steps and num_generated >= max_total_steps:
+                break
+
+            if first_iteration:
+                current_tokens = sampled_tokens
+                first_iteration = False
+            else:
+                if self.reuse_ids_buffer:
+                    ids_buf[:, 0] = torch.tensor(token_column, dtype=torch.long, device=device)
+                    step_ids = ids_buf
+                else:
+                    step_ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                active_mask = torch.tensor([not state.completed for state in row_states], dtype=torch.bool, device=device)
+                step_token_mask = active_mask.unsqueeze(1)
+                next_lengths = lengths_by_batch + step_token_mask[:, 0].to(lengths_by_batch.dtype)
+                attn_mask = self._build_attention_mask(next_lengths)
+                logits = self.model.forward(step_ids, kv_cache=kv_cache_decode, attention_mask=attn_mask, token_mask=step_token_mask)
+                logits = logits[:, -1, :]
+                sampled_tokens = self._sample_batch_tokens(logits, rng, temps, top_ks, active_mask, pad_id)
+                lengths_by_batch = next_lengths
+                current_tokens = sampled_tokens
+
+            token_column = []
+            token_masks = []
+            for i, state in enumerate(row_states):
+                if state.completed or generated_counts[i] >= row_max_tokens[i]:
+                    token_masks.append(-1)
+                    token_column.append(pad_id)
+                    continue
+
+                is_forced = len(state.forced_tokens) > 0
+                token_masks.append(0 if is_forced else 1)
+                next_token = state.forced_tokens.popleft() if is_forced else current_tokens[i]
+                token_column.append(next_token)
+                state.current_tokens.append(next_token)
+                generated_counts[i] += 1
+
+                if next_token == assistant_end or next_token == bos or generated_counts[i] >= row_max_tokens[i]:
+                    state.completed = True
+                if next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_tokens = []
+                elif next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None:
+                            result_tokens = self.tokenizer.encode(str(result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+
+            yield token_column, token_masks
+            num_generated += 1
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.

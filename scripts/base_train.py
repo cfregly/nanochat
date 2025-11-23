@@ -53,6 +53,9 @@ warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
+# Data loader
+tokenizer_threads = 4 # threads for tokenizer encode
+tokenizer_batch_size = 128 # rows per tokenizer batch
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -60,6 +63,11 @@ core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+skip_initial_eval = False # if True, skip the eval pass at step 0 (useful for quick perf baselines)
+use_compile = True # if False, skip torch.compile and run in eager (useful for quick perf baselines)
+use_fp32_logits = True # if False, keep logits in bf16 during loss (useful for perf benchmarking)
+use_dist_adamw = True # if False, force torch.optim.AdamW (fused) even when ddp=False; useful for small, single-node runs
+use_flash_sdp = False # if True, prefer Flash SDP kernels for attention (when supported)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -110,7 +118,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, use_fp32_logits=use_fp32_logits, use_flash_sdp=use_flash_sdp)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
@@ -129,7 +137,10 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if use_compile:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+else:
+    print0("Skipping torch.compile; using eager model (use_compile=False)")
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -169,8 +180,23 @@ if resuming:
 # Initialize the DataLoaders for train/val
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state(
+    device_batch_size,
+    max_seq_len,
+    split="train",
+    tokenizer_threads=tokenizer_threads,
+    tokenizer_batch_size=tokenizer_batch_size,
+    device=device,
+    resume_state_dict=dataloader_resume_state_dict,
+)
+build_val_loader = lambda: tokenizing_distributed_data_loader(
+    device_batch_size,
+    max_seq_len,
+    split="val",
+    tokenizer_threads=tokenizer_threads,
+    tokenizer_batch_size=tokenizer_batch_size,
+    device=device,
+)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -216,7 +242,10 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
+    eval_enabled = last_step or (eval_every > 0 and step % eval_every == 0)
+    if skip_initial_eval and step == 0 and not last_step:
+        eval_enabled = False
+    if eval_enabled:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)

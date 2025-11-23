@@ -13,7 +13,7 @@ dependencies = [
     "setuptools>=80.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch>=2.8.0",
+    "torch>=2.10.0.dev0",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -43,12 +43,12 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# target torch to CUDA 13.0 or CPU
 [tool.uv.sources]
 torch = [  
-    { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "gpu" },  
-]
+    { index = "pytorch-cpu-nightly", extra = "cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version < '3.12'" },  
+    { index = "pytorch-cu130-nightly", extra = "gpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },  
+]  
 
 [[tool.uv.index]]  
 name = "pytorch-cpu"  
@@ -56,8 +56,13 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true  
   
 [[tool.uv.index]]  
-name = "pytorch-cu128"  
-url = "https://download.pytorch.org/whl/cu128"  
+name = "pytorch-cpu-nightly"  
+url = "https://download.pytorch.org/whl/nightly/cpu"  
+explicit = true  
+  
+[[tool.uv.index]]  
+name = "pytorch-cu130-nightly"  
+url = "https://download.pytorch.org/whl/nightly/cu130"  
 explicit = true
 
 [project.optional-dependencies]  
@@ -68,7 +73,7 @@ gpu = [
     "torch>=2.8.0",  
 ]  
   
-[tool.uv]  
+[tool.uv]
 conflicts = [  
     [  
         { extra = "cpu" },  

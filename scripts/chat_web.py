@@ -37,14 +37,13 @@ import torch
 import asyncio
 import logging
 import random
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext, suppress
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
-from contextlib import nullcontext
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
@@ -72,6 +71,11 @@ parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run th
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--reuse-ids-buffer', action='store_true', default=False, help='Reuse GPU buffer for next-token IDs during inference (micro-optimization, default off to match original behavior)')
+parser.add_argument('--enable-batch-decode', action='store_true', default=False, help='Enable padded attention + batched decode path')
+parser.add_argument('--enable-dynamic-batching', action='store_true', default=False, help='Enable request queue + dynamic batching (experimental)')
+parser.add_argument('--batch-size', type=int, default=4, help='Maximum requests to batch together when dynamic batching is enabled')
+parser.add_argument('--batch-timeout-ms', type=int, default=10, help='Batch collection timeout in milliseconds for dynamic batching')
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -94,6 +98,13 @@ class Worker:
     engine: Engine
     tokenizer: object
     autocast_ctx: torch.amp.autocast
+
+@dataclass
+class BatchItem:
+    tokens: list
+    request: ChatRequest
+    queue: asyncio.Queue
+    response_tokens: list
 
 class WorkerPool:
     """Pool of workers, each with a model replica on a different GPU."""
@@ -124,7 +135,12 @@ class WorkerPool:
                 print(f"Loading model on {device_type}...")
 
             model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
-            engine = Engine(model, tokenizer)
+            engine = Engine(
+                model,
+                tokenizer,
+                reuse_ids_buffer=args.reuse_ids_buffer,
+                enable_batch_decode=args.enable_batch_decode or args.enable_dynamic_batching
+            )
             autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
             worker = Worker(
@@ -156,6 +172,27 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_k: Optional[int] = None
+
+def build_conversation_tokens(tokenizer, messages):
+    bos = tokenizer.get_bos_token_id()
+    user_start = tokenizer.encode_special("<|user_start|>")
+    user_end = tokenizer.encode_special("<|user_end|>")
+    assistant_start = tokenizer.encode_special("<|assistant_start|>")
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
+
+    conversation_tokens = [bos]
+    for message in messages:
+        if message.role == "user":
+            conversation_tokens.append(user_start)
+            conversation_tokens.extend(tokenizer.encode(message.content))
+            conversation_tokens.append(user_end)
+        elif message.role == "assistant":
+            conversation_tokens.append(assistant_start)
+            conversation_tokens.extend(tokenizer.encode(message.content))
+            conversation_tokens.append(assistant_end)
+
+    conversation_tokens.append(assistant_start)
+    return conversation_tokens
 
 def validate_chat_request(request: ChatRequest):
     """Validate chat request to prevent abuse."""
@@ -226,8 +263,15 @@ async def lifespan(app: FastAPI):
     print("Loading nanochat models across GPUs...")
     app.state.worker_pool = WorkerPool(num_gpus=args.num_gpus)
     await app.state.worker_pool.initialize(args.source, model_tag=args.model_tag, step=args.step)
+    if args.enable_dynamic_batching:
+        app.state.batch_queue = asyncio.Queue()
+        app.state.batcher_task = asyncio.create_task(batching_loop(app))
     print(f"Server ready at http://localhost:{args.port}")
     yield
+    if args.enable_dynamic_batching:
+        app.state.batcher_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.batcher_task
 
 app = FastAPI(lifespan=lifespan)
 
@@ -310,6 +354,90 @@ async def generate_stream(
 
     yield f"data: {json.dumps({'done': True})}\n\n"
 
+async def process_batch(app: FastAPI, worker: Worker, batch_items: List[BatchItem]):
+    assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
+    bos = worker.tokenizer.get_bos_token_id()
+    queues = [item.queue for item in batch_items]
+    accum_tokens = [[] for _ in batch_items]
+    last_clean_text = [""] * len(batch_items)
+    done = [False] * len(batch_items)
+    response_tokens = [item.response_tokens for item in batch_items]
+
+    temperatures = [
+        item.request.temperature if item.request.temperature is not None else args.temperature
+        for item in batch_items
+    ]
+    top_ks = [
+        item.request.top_k if item.request.top_k is not None else args.top_k
+        for item in batch_items
+    ]
+    max_tokens_list = [
+        item.request.max_tokens if item.request.max_tokens is not None else args.max_tokens
+        for item in batch_items
+    ]
+    tokens_batch = [item.tokens for item in batch_items]
+
+    try:
+        with worker.autocast_ctx:
+            for token_column, token_masks in worker.engine.generate_batched(
+                tokens_batch,
+                max_tokens=max_tokens_list,
+                temperature=temperatures,
+                top_k=top_ks,
+                seed=random.randint(0, 2**31 - 1)
+            ):
+                for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+                    if mask == -1:
+                        done[i] = True
+                        continue
+                    if done[i]:
+                        continue
+                    if token == assistant_end or token == bos:
+                        done[i] = True
+                        continue
+
+                    accum_tokens[i].append(token)
+                    current_text = worker.tokenizer.decode(accum_tokens[i])
+                    if not current_text.endswith('�'):
+                        new_text = current_text[len(last_clean_text[i]):]
+                        if new_text:
+                            response_tokens[i].append(new_text)
+                            last_clean_text[i] = current_text
+                            payload = json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)
+                            await queues[i].put(f"data: {payload}\n\n")
+                if all(done):
+                    break
+    except Exception as e:
+        error_payload = json.dumps({'error': str(e)}, ensure_ascii=False)
+        for q in queues:
+            await q.put(f"data: {error_payload}\n\n")
+    finally:
+        for i, q in enumerate(queues):
+            await q.put(f"data: {json.dumps({'done': True})}\n\n")
+            await q.put(None)
+            full_response = "".join(response_tokens[i])
+            logger.info(f"[ASSISTANT] (GPU {worker.gpu_id}) [batch {i+1}/{len(batch_items)}]: {full_response}")
+        logger.info("="*20)
+        await app.state.worker_pool.release_worker(worker)
+
+async def batching_loop(app: FastAPI):
+    while True:
+        try:
+            first_item = await app.state.batch_queue.get()
+        except asyncio.CancelledError:
+            break
+
+        batch = [first_item]
+        try:
+            while len(batch) < args.batch_size:
+                next_item = await asyncio.wait_for(app.state.batch_queue.get(), timeout=args.batch_timeout_ms / 1000)
+                batch.append(next_item)
+        except asyncio.TimeoutError:
+            pass
+
+        worker = await app.state.worker_pool.acquire_worker()
+        asyncio.create_task(process_batch(app, worker, batch))
+
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest):
     """Chat completion endpoint (streaming only) - uses worker pool for multi-GPU."""
@@ -323,31 +451,40 @@ async def chat_completions(request: ChatRequest):
         logger.info(f"[{message.role.upper()}]: {message.content}")
     logger.info("-"*20)
 
+    conversation_tokens = build_conversation_tokens(
+        app.state.worker_pool.workers[0].tokenizer,
+        request.messages
+    )
+
+    # Dynamic batching path queues the request instead of acquiring a worker immediately
+    if args.enable_dynamic_batching:
+        response_queue: asyncio.Queue = asyncio.Queue()
+        batch_item = BatchItem(
+            tokens=conversation_tokens,
+            request=request,
+            queue=response_queue,
+            response_tokens=[]
+        )
+        await app.state.batch_queue.put(batch_item)
+
+        async def stream_from_queue():
+            while True:
+                chunk = await response_queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+            logger.info("="*20)
+
+        return StreamingResponse(
+            stream_from_queue(),
+            media_type="text/event-stream"
+        )
+
     # Acquire a worker from the pool (will wait if all are busy)
     worker_pool = app.state.worker_pool
     worker = await worker_pool.acquire_worker()
 
     try:
-        # Build conversation tokens
-        bos = worker.tokenizer.get_bos_token_id()
-        user_start = worker.tokenizer.encode_special("<|user_start|>")
-        user_end = worker.tokenizer.encode_special("<|user_end|>")
-        assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
-        assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
-
-        conversation_tokens = [bos]
-        for message in request.messages:
-            if message.role == "user":
-                conversation_tokens.append(user_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(user_end)
-            elif message.role == "assistant":
-                conversation_tokens.append(assistant_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(assistant_end)
-
-        conversation_tokens.append(assistant_start)
-
         # Streaming response with worker release after completion
         response_tokens = []
         async def stream_and_release():
