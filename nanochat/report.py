@@ -89,6 +89,8 @@ def estimate_cost(gpu_info, runtime_hours=None):
     # Rough pricing, from Lambda Cloud
     default_rate = 2.0
     gpu_hourly_rates = {
+        "GB200": 3.40,
+        "B200": 2.25,
         "H100": 3.00,
         "A100": 1.79,
         "V100": 0.55,

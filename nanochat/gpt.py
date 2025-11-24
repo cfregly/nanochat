@@ -15,6 +15,7 @@ import math
 from functools import partial
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,22 @@ except Exception:  # pragma: no cover - defensive fallback when running standalo
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat.kernels.clustered_attention import clustered_attention
+from nanochat.kernels.stubs import resolve_clustered_attention_kernel
+
+
+def _maybe_make_weight_only_linear(in_features, out_features, config, name="linear"):
+    """Create a linear layer; optionally use Transformer Engine when flagged."""
+    use_te = getattr(config, "use_te_weight_only", False)
+    if not use_te:
+        return nn.Linear(in_features, out_features, bias=False), None
+    try:  # pragma: no cover - optional dependency
+        import transformer_engine.pytorch as te  # type: ignore
+    except Exception as exc:
+        raise ImportError(f"use_te_weight_only=True but Transformer Engine is unavailable for {name}") from exc
+    params_dtype = torch.float16 if str(getattr(config, "te_weight_dtype", "fp8")).lower() in ("fp4", "int4", "fp16") else torch.float32
+    layer = te.Linear(in_features, out_features, bias=False, params_dtype=params_dtype)
+    return layer, "te"
 
 @dataclass
 class GPTConfig:
@@ -41,6 +58,22 @@ class GPTConfig:
     use_fp32_logits: bool = True  # if False, keep logits in bf16 during loss to hit fused CE
     use_flash_sdp: bool = True  # if True, prefer Flash/TE SDP kernels (training path)
     use_padded_attention: bool = False  # if True, enable attention masks for padded batches
+    use_flash3: bool = True  # prefer FlashAttention-3 varlen kernels (B200/TMA) when available
+    flash3_block_size: int = 128  # sequence tile for FA3 varlen kernels (aligns to TMEM staging)
+    kv_block_size: Optional[int] = None  # optional KV cache block size for TMA/paged layout
+    kv_page_size: Optional[int] = None  # optional KV cache page size for growth hints
+    enable_persistent_decode: bool = False  # gate persistent decode kernels (Engine)
+    use_cuda_graphs: bool = False  # gate CUDA Graph capture in Engine generate paths
+    use_te_weight_only: bool = False  # if True, prefer Transformer Engine weight-only linears (q/k/v/proj + lm_head)
+    te_weight_dtype: str = "fp8"  # fp8|fp4|int4 hint for TE weight-only path
+    use_cta_clustering: bool = False  # if True, enable CTA clustering (prefill) when kernels are available
+    cta_cluster_size: int = 2  # default CTAs per cluster (auto-tuned per sequence length)
+    cta_cluster_seq_threshold: int = 1024  # minimum sequence length before attempting clustering
+    use_clustered_attention_kernel: bool = False  # experimental: attempt custom clustered attention kernel (requires build)
+    use_persistent_decode_kernel: bool = False  # experimental: attempt custom resident decode kernel (requires build)
+    clustered_attention_impl: Optional[str] = None  # optional module:function override for clustered attention
+    persistent_decode_impl: Optional[str] = None  # optional module:function override for persistent decode
+    allow_kernel_stub_fallback: bool = False  # allow falling back to reference path instead of raising when kernel flags are on
 
 
 def norm(x):
@@ -61,24 +94,141 @@ def apply_rotary_emb(x, cos, sin):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         self.use_flash_sdp = config.use_flash_sdp
+        self.use_flash3 = getattr(config, "use_flash3", False)
+        self.flash3_block_size = getattr(config, "flash3_block_size", None)
+        self.use_te_weight_only = getattr(config, "use_te_weight_only", False)
+        self.use_cta_clustering = getattr(config, "use_cta_clustering", False)
+        self.cta_cluster_seq_threshold = getattr(config, "cta_cluster_seq_threshold", 1024)
+        self.cta_cluster_size = getattr(config, "cta_cluster_size", 2)
+        self.use_clustered_attention_kernel = getattr(config, "use_clustered_attention_kernel", False)
         self.use_padded_attention = config.use_padded_attention
+        self.clustered_attention_impl = getattr(config, "clustered_attention_impl", None)
+        self.allow_kernel_stub_fallback = getattr(config, "allow_kernel_stub_fallback", False)
+        # Allow swapping in custom clustered-attention kernels when flagged
+        self.clustered_attention_kernel = resolve_clustered_attention_kernel(
+            fallback=clustered_attention,
+            impl=self.clustered_attention_impl,
+            allow_fallback=self.allow_kernel_stub_fallback,
+        )
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.weight_only_backend = None
+        self.c_q, backend = _maybe_make_weight_only_linear(self.n_embd, self.n_head * self.head_dim, config, name="c_q")
+        self.weight_only_backend = backend or self.weight_only_backend
+        self.c_k, backend = _maybe_make_weight_only_linear(self.n_embd, self.n_kv_head * self.head_dim, config, name="c_k")
+        self.weight_only_backend = backend or self.weight_only_backend
+        self.c_v, backend = _maybe_make_weight_only_linear(self.n_embd, self.n_kv_head * self.head_dim, config, name="c_v")
+        self.weight_only_backend = backend or self.weight_only_backend
+        self.c_proj, backend = _maybe_make_weight_only_linear(self.n_embd, self.n_embd, config, name="c_proj")
+        self.weight_only_backend = backend or self.weight_only_backend
         self.sdpa_ctx_factory = prefer_sdpa_backends if prefer_sdpa_backends is not None else (lambda order=None: nullcontext())
+        if self.use_flash3 and torch.cuda.is_available():
+            cc_major, _ = torch.cuda.get_device_capability()
+            if cc_major < 10:
+                self.use_flash3 = False
+        self.flash3_fn = None
+        self.flash3_error = None
+        if self.use_flash3:
+            self._init_flash3()
+
+    def _init_flash3(self):
+        """Best-effort lazy import of FlashAttention-3 varlen kernel."""
+        try:  # pragma: no cover - import guard
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func  # type: ignore
+
+            self.flash3_fn = flash_attn_varlen_func
+        except Exception as exc:
+            self.flash3_error = str(exc)
+            self.flash3_fn = None
+            self.use_flash3 = False
+
+    def _flash3_supported(self, q, attn_mask):
+        if not self.use_flash3 or self.flash3_fn is None:
+            return False
+        if attn_mask is not None or self.use_padded_attention:
+            return False
+        if not q.is_cuda:
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        return True
+
+    def _auto_cluster_size(self, seq_len):
+        # Simple heuristic: larger sequences benefit from larger clusters
+        if seq_len >= 4096:
+            return max(4, self.cta_cluster_size)
+        if seq_len >= 2048:
+            return max(3, self.cta_cluster_size)
+        return self.cta_cluster_size
+
+    def _flash3_attention(self, q, k, v, kv_cache, enable_gqa, use_clustering=False):
+        """Varlen FlashAttention-3 path (no masks). Returns None on fallback."""
+        Tq, Tk = q.size(2), k.size(2)
+        if kv_cache is None or Tq == Tk:
+            causal = True
+        elif Tq == 1:
+            causal = False  # steady-state decode: allow full prefix
+        else:
+            return None  # unsupported shape, fall back to SDPA
+        # Expand GQA heads if FA3 build doesn't expose num_heads_k
+        if enable_gqa and self.n_head != self.n_kv_head:
+            repeat_k = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(repeat_k, dim=1)
+            v = v.repeat_interleave(repeat_k, dim=1)
+        B, Hq, _, D = q.size()
+        _, Hk, _, _ = k.size()
+        q_flat = q.transpose(1, 2).reshape(B * Tq, Hq, D)
+        k_flat = k.transpose(1, 2).reshape(B * Tk, Hk, D)
+        v_flat = v.transpose(1, 2).reshape(B * Tk, Hk, D)
+        cu_q = torch.arange(0, (B + 1) * Tq, step=Tq, device=q.device, dtype=torch.int32)
+        cu_k = torch.arange(0, (B + 1) * Tk, step=Tk, device=q.device, dtype=torch.int32)
+        
+        # CTA clustering hint: Some FlashAttention-3 builds support num_sm_clusters
+        # to enable cooperative thread array clustering on Hopper/Blackwell
+        fa3_kwargs = dict(
+            dropout_p=0.0,
+            causal=causal,
+        )
+        if use_clustering:
+            # Try to pass cluster size hint if FlashAttention-3 supports it
+            # This enables __cluster_dims__ in CUDA kernels for better L1 sharing
+            try:
+                import inspect
+                if 'num_sm_clusters' in inspect.signature(self.flash3_fn).parameters:
+                    fa3_kwargs['num_sm_clusters'] = self._auto_cluster_size(Tk)
+            except Exception:
+                pass  # Clustering not supported in this FA3 build, continue without it
+        
+        out = self.flash3_fn(  # type: ignore[misc]
+            q_flat,
+            k_flat,
+            v_flat,
+            cu_q,
+            cu_k,
+            Tq,
+            Tk,
+            **fa3_kwargs,
+        )
+        return out.view(B, Tq, Hq, D).transpose(1, 2).contiguous()
 
     def forward(self, x, cos_sin, kv_cache, attention_mask=None, token_mask=None):
         B, T, C = x.size()
-
+        
+        # CTA clustering hint for attention kernels (Blackwell/Hopper optimization)
+        # Note: Full CTA clustering requires custom CUDA kernels with __cluster_dims__ annotations
+        # or FlashAttention-3 cluster support. This flag enables best-effort optimizations:
+        # 1. Use larger tile sizes when T >= threshold (better SM occupancy)
+        # 2. Provide hint to flash_attn_varlen_func if it supports clustering
+        # 3. Enable when custom cluster kernels become available
+        use_cta_hint = self.use_cta_clustering and T >= self.cta_cluster_seq_threshold
+        
         # Project the input to get queries, keys, and values
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -133,21 +283,37 @@ class CausalSelfAttention(nn.Module):
                     causal[:, :prefix_len] = True
                 causal[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
             attn_mask = key_mask & causal
-
-        with self.sdpa_ctx_factory(sdpa_order):
-            if attn_mask is not None:
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
-            elif kv_cache is None or Tq == Tk:
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-            elif Tq == 1:
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        fa3_out = None
+        if attn_mask is None and self._flash3_supported(q, attn_mask):
+            fa3_out = self._flash3_attention(q, k, v, kv_cache, enable_gqa=enable_gqa, use_clustering=use_cta_hint)
+        if fa3_out is not None:
+            y = fa3_out
+        else:
+            if self.use_clustered_attention_kernel:
+                y = self.clustered_attention_kernel(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    causal=(kv_cache is None or Tq == Tk) if kv_cache is None else (Tq == Tk or Tq == 1),
+                    num_sm_clusters=self._auto_cluster_size(Tk) if use_cta_hint else None,
+                    enable_gqa=enable_gqa and self.n_head != self.n_kv_head,
+                )
             else:
-                attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
-                prefix_len = Tk - Tq
-                if prefix_len > 0: # can't be negative but could be zero
-                    attn_mask[:, :prefix_len] = True
-                attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+                with self.sdpa_ctx_factory(sdpa_order):
+                    if attn_mask is not None:
+                        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+                    elif kv_cache is None or Tq == Tk:
+                        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+                    elif Tq == 1:
+                        y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+                    else:
+                        attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
+                        prefix_len = Tk - Tq
+                        if prefix_len > 0: # can't be negative but could be zero
+                            attn_mask[:, :prefix_len] = True
+                        attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+                        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -188,7 +354,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head, _ = _maybe_make_weight_only_linear(config.n_embd, config.vocab_size, config, name="lm_head")
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.

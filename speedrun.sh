@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script is the "Best ChatGPT clone that $100 can buy",
-# It is designed to run in ~4 hours on 8XH100 node at $3/GPU/hour.
+# It is designed to run in ~3.2 hours on an 8xB200 node at $2.25/GPU/hour.
 
 # 1) Example launch (simplest):
 # bash speedrun.sh

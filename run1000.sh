@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # The $1000 tier of nanochat
-# Designed to run end-to-end for $1000/24 ~= 41.6 hours on an 8XH100 node
+# Designed to run end-to-end for $1000/24 ~= 41.6 hours on an 8xB200 node (faster in practice)
 # A bit sparser on comments, see speedrun.sh for more detail
 
 # all the setup stuff
@@ -30,7 +30,7 @@ python -m scripts.tok_train --max_chars=4000000000
 python -m scripts.tok_eval
 
 # Documenting my process for determining the hyperparameters for this run1000.sh script:
-# We want a budget of approx. $1000 ~= 41.6 hours of 8XH100 compute
+# We want a budget of approx. $1000 ~= 41.6 hours of 8xB200 compute
 # 1) I guessed the model size for this to be about depth=32
 # 2) Determine the device_batch_size that fits:
 # Running the base_train.py script with --depth=32, I saw that --device_batch_size=16
