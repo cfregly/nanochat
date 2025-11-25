@@ -1,5 +1,25 @@
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
+
+# Use new SDPA API when available (PyTorch 2.2+)
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    _EFFICIENT_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    _NEW_SDPA_API = True
+except ImportError:
+    sdpa_kernel = None  # type: ignore[assignment]
+    SDPBackend = None  # type: ignore[assignment]
+    _EFFICIENT_BACKENDS = []
+    _NEW_SDPA_API = False
+
+
+def _efficient_sdpa_context():
+    """Return context manager for memory-efficient + math attention backends."""
+    if _NEW_SDPA_API and sdpa_kernel is not None:
+        return sdpa_kernel(_EFFICIENT_BACKENDS)
+    return nullcontext()
 
 
 def _flash3_clustered(q, k, v, causal: bool, num_sm_clusters: int | None):
@@ -68,7 +88,7 @@ def clustered_attention(
 
     # SDPA fallback
     # attn_mask semantics: True=keep, False=mask
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=True):
+    with _efficient_sdpa_context():
         if use_mask:
             return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         return F.scaled_dot_product_attention(q, k, v, is_causal=causal)

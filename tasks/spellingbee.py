@@ -166,7 +166,7 @@ First spell the word out:
 
 Then count the occurrences of '{letter}':
 """
-        # Little simulated loop of the solution process
+    # Little simulated loop of the solution process
         # TODO: This is where the fun starts, we could simulate cute little mistakes
         # and get the model to review its work and recover from them.
         # You might of course hope this could arise in RL too, but realistically you'd want to help it out a bit.

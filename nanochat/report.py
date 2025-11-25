@@ -19,7 +19,7 @@ def run_command(cmd):
         if result.returncode == 0:
             return result.stdout.strip()
         return None
-    except:
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
 
 def get_git_info():
@@ -225,10 +225,7 @@ def extract_timestamp(content, prefix):
     for line in content.split('\n'):
         if line.startswith(prefix):
             time_str = line.split(":", 1)[1].strip()
-            try:
                 return datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-            except:
-                pass
     return None
 
 class Report:
