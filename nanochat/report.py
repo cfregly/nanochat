@@ -225,7 +225,7 @@ def extract_timestamp(content, prefix):
     for line in content.split('\n'):
         if line.startswith(prefix):
             time_str = line.split(":", 1)[1].strip()
-                return datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            return datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
     return None
 
 class Report:
